@@ -57,15 +57,20 @@ def get_word_sketch_data(verb, noun):
 @click.option("--verbs", default=None, help="Comma-separated list of verbs to process (e.g., 'kick,kill,spill'). If None, processes all.")
 @click.option("--nouns", default=None, help="Comma-separated list of nouns to process (e.g., 'ball,bunny,sponge'). If None, processes all.")
 @click.option("--checkpoint-freq", default=1, help="Save checkpoint every N verbs/nouns processed (default: 1)")
-def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, max_word_count, verbs, nouns, checkpoint_freq):
+@click.option("--checkpoint-dir", default="data/processed/checkpoints", help="Directory to save checkpoints")
+def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, max_word_count, verbs, nouns, checkpoint_freq, checkpoint_dir):
     """Build comprehensive KWIC dataset"""
     
     print("\n" + "="*80)
     print("BUILDING COMPREHENSIVE KWIC DATASET")
     print("="*80)
+
+    # ensure dirs for outputs exist
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_json).parent.mkdir(parents=True, exist_ok=True)
     
     # Setup checkpoint
-    checkpoint_dir = Path("data/processed/checkpoints")
+    checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = checkpoint_dir / "comprehensive_kwic_checkpoint.json"
     
