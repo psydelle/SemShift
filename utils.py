@@ -18,6 +18,7 @@ import time
 from dotenv import load_dotenv
 import requests as r
 import functools
+import spacy
 
 
 # load the environment variables
@@ -28,6 +29,14 @@ CORPUS = "preloaded/ententen21_tt31"
 API_KEY = os.environ.get("SE_API_KEY")
 USERNAME = os.environ.get("SE_USERNAME")
 BASE_URL = "https://api.sketchengine.eu/bonito/run.cgi"
+
+# Lazy load spaCy model
+_nlp = None
+def get_nlp():
+    global _nlp
+    if _nlp is None:
+        _nlp = spacy.load("en_core_web_sm")
+    return _nlp
 
 
 # ---------------------------------------------------------------------------------------------#
@@ -353,6 +362,8 @@ def get_vn_kwics(
                 n_ctx_sentences=n_ctx_sentences,
                 max_word_count=max_word_count,
                 collocate_position="right" if verb is not None else "left",  # if we're querying by verb, look for noun in right context, and vice versa
+                verb_lemma=_verb,
+                noun_lemma=_noun,
             )
             if not vn_kwics:
                 continue
@@ -378,7 +389,9 @@ def get_vn_kwics(
             n_kwics=n_kwics,
             n_ctx_sentences=n_ctx_sentences,
             max_word_count=max_word_count,
-            collocate_position="right"
+            collocate_position="right",
+            verb_lemma=verb,
+            noun_lemma=noun,
         )
         verb_noun_pairs = [(verb, noun)] * len(kwics)
 
@@ -389,6 +402,48 @@ def get_vn_kwics(
     return df
 
 
+def _check_syntax(text, verb_lemma, noun_lemma):
+    """
+    Check if verb and noun have valid syntactic relationship.
+    Only accepts object relationships (direct object, indirect object, passive subject).
+    Returns True if valid, False otherwise.
+    """
+    nlp = get_nlp()
+    doc = nlp(text)
+    
+    # Find all verb and noun tokens
+    verb_tokens = [t for t in doc if t.lemma_ == verb_lemma and t.pos_ == "VERB"]
+    noun_tokens = [t for t in doc if t.lemma_ == noun_lemma and t.pos_ in {"NOUN", "PROPN"}]
+    
+    if not verb_tokens or not noun_tokens:
+        return False
+    
+    # Check each verb-noun pair for valid syntactic relationships
+    for verb_tok in verb_tokens:
+        for noun_tok in noun_tokens:
+            # Skip uppercase nouns
+            if not noun_tok.text.islower():
+                continue
+            
+            # Check distance constraint
+            if abs(noun_tok.i - verb_tok.i) > 10:
+                continue
+            
+            # Direct dependency: noun as object of verb
+            if noun_tok.head == verb_tok:
+                # Only accept object relations (direct, indirect) and passive subjects
+                if noun_tok.dep_ in {"dobj", "obj", "iobj", "nsubjpass"}:
+                    return True
+            
+            # Verb in relative clause modifying noun (e.g., "the ball that was kicked")
+            # Here the noun is still semantically the object of the verb
+            if verb_tok.head == noun_tok:
+                if verb_tok.dep_ in {"relcl", "acl"}:
+                    return True
+    
+    return False
+
+
 def _get_kwics_from_query(
     corpus_name,
     ws_seek_query=None,
@@ -397,12 +452,18 @@ def _get_kwics_from_query(
     n_ctx_sentences=1,
     max_word_count=100,
     collocate_position="right",  # whether to look for the collocate in the right or left context. Should be right for querying verbs and left for querying nouns
+    verb_lemma=None,  # for syntactic filtering
+    noun_lemma=None,  # for syntactic filtering
+    max_pages=20,  # maximum pages to fetch before giving up
 ):
     is_fallback = ws_seek_query is None
     query = ws_seek_query if not is_fallback else reg_query
+    
+    # Enable syntax filtering if both verb and noun lemmas are provided
+    use_syntax_filter = verb_lemma is not None and noun_lemma is not None
 
     def get_data():
-        for page in range(1, 3):
+        for page in range(1, max_pages + 1):
             data = {
                 "corpname": corpus_name,
                 "q": query,
@@ -415,19 +476,30 @@ def _get_kwics_from_query(
                 "cup_hl": "q",
                 "structs": "s,g",
                 "fromp": page,
-                # get more than we need, to filter out long ones. TODO: requery on demand
+                # get more than we need, to filter out long ones
                 "pagesize": n_kwics * 2,
                 "kwicleftctx": f"-{n_ctx_sentences+1}:s",  # num sentences of left context
                 "kwicrightctx": f"{n_ctx_sentences+1}:s",  # num sentences of right context
             }
             kwics_data = _get_request(BASE_URL + "/concordance", data)
-            lines = kwics_data["Lines"]
+            lines = kwics_data.get("Lines", [])
+            
+            if not lines:
+                break  # No more results available
 
             yield from lines
 
     clean_lines = []
     kwic_words = []
+    
+    # Tracking statistics
+    total_processed = 0
+    filtered_syntax = 0
+    filtered_other = 0
+    
     for line in get_data():
+        total_processed += 1
+        
         # filter "strc", like sentence breaks
         left = [x["str"] for x in line["Left"] if "str" in x]
         right = [x["str"] for x in line["Right"] if "str" in x]
@@ -441,15 +513,16 @@ def _get_kwics_from_query(
             kwic2 = next((x["str"] for x in _coll_context if "coll" in x), None)
             
             if kwic2 is None:
+                filtered_other += 1
                 continue  # skip if collocate not in correct context (inverted order)
 
             if kwic == kwic2:
-                # skip if same word
-                continue
+                filtered_other += 1
+                continue  # skip if same word
 
             if not kwic.isalnum() or not kwic2.isalnum():
-                # skip if not alnum
-                continue
+                filtered_other += 1
+                continue  # skip if not alnum
 
             full_clean = left + [kwic] + right
 
@@ -459,27 +532,37 @@ def _get_kwics_from_query(
             raise NotImplementedError("IDK what this does anymore")
             kwic_str = [x["str"] for x in line["Kwic"] if "str" in x]
             if not all([x.isalnum() for x in kwic_str]):
-                # skip if not alnum
-                continue
+                filtered_other += 1
+                continue  # skip if not alnum
             kwic, kwic2 = kwic_str[0], kwic_str[-1]
             full_clean = left + kwic_str + right
 
         if len(full_clean) > max_word_count:
-            # skip if too many words
-            continue
+            filtered_other += 1
+            continue  # skip if too many words
 
         expected_kwic_in_left = 1 if collocate_position == "left" else 0
 
         if left.count(kwic) != expected_kwic_in_left:
-            # more than one instance of the verb appears in the left context
-            # filter to avoid doing character vs. token offset math later
-            continue
+            filtered_other += 1
+            continue  # more than one instance of the verb appears in the left context
 
         clean_line = " ".join(full_clean)
+        
+        # Apply syntactic filtering if enabled
+        if use_syntax_filter:
+            if not _check_syntax(clean_line, verb_lemma, noun_lemma):
+                filtered_syntax += 1
+                continue  # Skip if syntax is invalid
+        
         clean_lines.append(clean_line)
         kwic_words.append((kwic, kwic2))
         if len(clean_lines) >= n_kwics:
             break
+    
+    # Report filtering statistics
+    if use_syntax_filter and total_processed > 0:
+        print(f"  Filtering stats: {total_processed} processed, {filtered_syntax} rejected by syntax, {filtered_other} rejected by other filters, {len(clean_lines)} kept")
 
     # keep first N kwics under max_word_count
     if len(clean_lines) != n_kwics:
@@ -487,73 +570,6 @@ def _get_kwics_from_query(
         return None, None
 
     return clean_lines, kwic_words
-
-
-# def process_item(line):
-#     """
-#     Function to process an item from the dataframe
-#     Args:
-#         line (dict): dictionary with the data from the dataframe
-#     Returns:
-#         data (dict): dictionary with the processed data
-#     """
-#     data = {}
-#     kwics_sentences, kwic_words = get_vn_kwics(
-#         CORPUS,
-#         line["verb"],
-#         line["noun"],
-#         n_kwics=100,
-#         n_ctx_sentences=1,
-#         max_word_count=100,
-#     )
-#     data["verb"] = line["verb"]
-#     data["noun"] = line["noun"]
-#     data["kwics"], data["kwic_words"] = kwics_sentences, kwic_words
-#     return data
-
-
-# def process_line(line):
-#     ''' Function to process a line from the dataframe
-
-#     Args:
-#         line (dict): dictionary with the data from the dataframe
-#     Returns:
-#         p (dict): dictionary with the processed data
-
-#     '''
-#     p = process_item(line)
-#     if not p["kwics"]:
-#         print("No KWICS found for", line["item"])
-#     time.sleep(1)  # SketchEngine timeout mitigation:(
-#     return (line["item"], p)
-
-# #  # decorator to create a command line interface
-# # @click.command()
-# # @click.option("-f", "--csv-file", required=True)
-# # @click.option("-o", "--out-file", required=True)
-
-
-# def process_corpus(csv_file, out_file):
-#     ''' Function to process the corpus and save the data to a json file
-#     Args:
-#         csv_file (str): path to the csv file
-#         out_file (str): path to the output file
-#     '''
-#     in_df = pd.read_csv(csv_file)
-
-#     data = [process_line(line) for line in tqdm(in_df.iloc, total=len(in_df))]
-
-#     data = dict(data)
-
-#     with open(out_file, "w") as f:
-#         json.dump(data, f, ensure_ascii=True)
-
-
-# # if __name__ == "__main__":
-# #     process_corpus()
-
-
-# ---------------------------------------------------------------------------------------------#
 
 
 # Getting info from WordNet ------------------------------------------------------------------#

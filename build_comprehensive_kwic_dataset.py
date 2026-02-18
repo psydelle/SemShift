@@ -1,6 +1,6 @@
 """
 Build a comprehensive KWIC dataset with:
-1. Top 200 nouns per verb from SketchEngine
+1. Top 200 nouns per verb or verbs per noun from SketchEngine
 2. 100 KWICs for each verb-noun pair
 3. Concreteness ratings and SND metrics for nouns
 4. Count of nouns per verb for data completeness assessment
@@ -56,10 +56,13 @@ def get_word_sketch_data(verb, noun):
 @click.option("-m", "--max-word-count", default=100, help="Max words per KWIC")
 @click.option("--verbs", default=None, help="Comma-separated list of verbs to process (e.g., 'kick,kill,spill'). If None, processes all.")
 @click.option("--nouns", default=None, help="Comma-separated list of nouns to process (e.g., 'ball,bunny,sponge'). If None, processes all.")
-def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, max_word_count, verbs, nouns):
+@click.option("--checkpoint-freq", default=1, help="Save checkpoint every N verbs/nouns processed (default: 1)")
+def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, max_word_count, verbs, nouns, checkpoint_freq):
     """Build comprehensive KWIC dataset"""
     
-    print("Loading data...")
+    print("\n" + "="*80)
+    print("BUILDING COMPREHENSIVE KWIC DATASET")
+    print("="*80)
     
     # Setup checkpoint
     checkpoint_dir = Path("data/processed/checkpoints")
@@ -68,17 +71,17 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
     
     # Load checkpoint if it exists
     if checkpoint_file.exists():
-        print(f"Loading checkpoint from {checkpoint_file}")
-        with open(checkpoint_file, 'r') as f:
+        with open(checkpoint_file, 'r', encoding='utf-8') as f:
             checkpoint_data = json.load(f)
         comprehensive_data = checkpoint_data.get('data', {})
         kwics_json = checkpoint_data.get('kwics_json', {})
-        processed_pairs = set(checkpoint_data.get('processed_pairs', []))
-        print(f"Resuming from {len(processed_pairs)} processed verb-noun pairs")
+        processed_items = set(tuple(item) for item in checkpoint_data.get('processed_items', []))
+        print(f"\nResuming from checkpoint: {len(comprehensive_data)} pairs, {len(processed_items)} verbs/nouns processed")
     else:
         comprehensive_data = {}
         kwics_json = {}
-        processed_pairs = set()
+        processed_items = set()
+        print("\nStarting fresh (no checkpoint found)")
     
     # Load unique verbs from input CSV
     stimuli_df = pd.read_csv(input_csv)
@@ -93,23 +96,68 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
     if verbs is not None:
         test_verbs = set(v.strip() for v in verbs.split(','))
         unique_verbs = [v for v in filtered_verbs if v in test_verbs]
-        print(f"Testing with verbs: {list(unique_verbs)}")
     else:
         unique_verbs = filtered_verbs
-        print(f"Processing {len(unique_verbs)} verbs (excluded: {list(problematic_verbs)})")
     
-    print(f"Will process: {len(unique_verbs)} unique verbs and {len(all_nouns)} unique nouns from input CSV")
+    # If specific nouns requested, filter to only those
+    if nouns is not None:
+        test_nouns = set(n.strip() for n in nouns.split(','))
+        unique_nouns = [n for n in all_nouns if n in test_nouns]
+    else:
+        unique_nouns = list(all_nouns)
+    
+    # Build data_to_process based on what's specified
+    data_to_process = []
+    
+    # Determine what to process based on user input
+    if verbs is not None and nouns is None:
+        data_to_process = [(verb, None) for verb in unique_verbs]
+        query_mode = "verbs"
+    elif nouns is not None and verbs is None:
+        data_to_process = [(None, noun) for noun in unique_nouns]
+        query_mode = "nouns"
+    elif verbs is not None and nouns is not None:
+        data_to_process = [(verb, None) for verb in unique_verbs] + [(None, noun) for noun in unique_nouns]
+        query_mode = "verbs + nouns"
+    else:
+        data_to_process = [(verb, None) for verb in unique_verbs] + [(None, noun) for noun in unique_nouns]
+        query_mode = "full dataset"
+    
+    # Print processing plan
+    print(f"\nProcessing plan:")
+    print(f"  Query mode: {query_mode}")
+    print(f"  Verbs: {len(unique_verbs)} {'(excluded: ' + ', '.join(problematic_verbs) + ')' if verbs is None else ''}")
+    print(f"  Nouns: {len(unique_nouns)}")
+    print(f"  Total items to process: {len(data_to_process)}")
+    print(f"  KWICs per pair: {n_kwics}")
+    print(f"  Checkpoint frequency: every {checkpoint_freq} verb(s)/noun(s)")
     
     # Load metadata
     snd_dict = load_snd_data()
-    
-    # data_to_process = [(verb, None) for verb in unique_verbs] + [(None, noun) for noun in all_nouns]
-    # data_to_process = [(None, noun) for noun in all_nouns]
-    data_to_process = [(None, "ball"), ("kick", None)]
 
+    # Checkpoint tracking
+    items_processed_since_checkpoint = 0
+    total_filtered_out = 0
+    
+    def save_checkpoint():
+        """Save current progress to checkpoint file"""
+        checkpoint_data = {
+            'data': comprehensive_data,
+            'kwics_json': kwics_json,
+            'processed_items': list(processed_items)
+        }
+        with open(checkpoint_file, 'w', encoding='utf-8') as f:
+            json.dump(checkpoint_data, f, ensure_ascii=False)
+        print(f"    ✓ Checkpoint saved: {len(comprehensive_data)} pairs, {len(processed_items)} verbs/nouns")
     
     # Process each item (verb or noun) and get KWICs for all verb-noun pairs
-    for verb, noun in tqdm(data_to_process, desc="Processing items"):
+    print("\nStarting processing...\n")
+    for verb, noun in tqdm(data_to_process, desc="Processing"):
+        # Skip if already processed (from checkpoint)
+        item_key = (verb, noun)
+        if item_key in processed_items:
+            continue
+        
         verb_noun_count = 0
         
         # Get all paired items (nouns for verb, verbs for noun) (max 200 from SketchEngine)
@@ -121,88 +169,111 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
                 n_kwics=n_kwics,
                 n_ctx_sentences=n_ctx_sentences,
                 max_word_count=max_word_count,
-                subset_to_top_n_pairs=3
+                # subset_to_top_n_pairs=200,
                 # subset_to_top_n_pairs=9999  # Get all available pairs, we'll filter later
             )
             
             if kwics_df is not None and not kwics_df.empty:
                 # Group by noun and process each verb-noun pair
                 for (_verb, _noun), group in kwics_df.groupby(["verb", "noun"]):
-                    if f"{_verb} {_noun}" in comprehensive_data:
-                        if verb is not None:
-                            comprehensive_data[f"{_verb} {_noun}"]['queried_by_verb'] = 1
-                        elif noun is not None:
-                            comprehensive_data[f"{_verb} {_noun}"]['queried_by_noun'] = 1
-                        else:
-                            raise ValueError("Both verb and noun cannot be None")
-                    else:
-                        # FILTER 1: Skip nouns less than 3 characters
-                        if len(_noun) < 3:
-                            continue
-                        
-                        kwics_list = group["kwics"].tolist()
-                        kwic_words_list = group["kwic_words"].tolist()
-                        
-                        # Skip if we don't have enough KWICs
-                        if len(kwics_list) != n_kwics:
-                            print(f"Skipping {_verb}-{_noun}: only got {len(kwics_list)} KWICs")
-                            continue
-                        
-                        # Get word sketch data for this verb-noun pair
-                        ws_data = get_word_sketch_data(_verb, _noun)
-                        
-                        # Get concreteness for noun using existing utility function
-                        noun_concreteness = get_concreteness_rating(_noun)
-                        
-                        # FILTER 2: Reject words if concreteness is not available (likely slang/informal)
-                        if noun_concreteness is None or pd.isna(noun_concreteness):
-                            continue
-                        
-                        # Get SND metrics for noun
-                        snd_data = snd_dict.get(_noun.lower(), {})
-                        
-                        # Get synset lengths from WordNet
-                        noun_synset_len = get_len_synset(_noun, pos=wn.NOUN)
-                        verb_synset_len = get_len_synset(_verb, pos=wn.VERB)
-                        
-                        # Create comprehensive record
-                        record = {
-                            'verb': _verb,
-                            'noun': _noun,
-                            'item': f"{_verb} {_noun}",
-                            'n_kwics': len(kwics_list),
-                            'coll_freq': ws_data['coll_freq'],
-                            'logDice': ws_data['logDice'],
-                            'usage': ws_data['usage'],
-                            'noun_concreteness': noun_concreteness,
-                            'noun_synset_len': noun_synset_len,
-                            'verb_synset_len': verb_synset_len,
-                            'snd3': snd_data.get('snd3', None),
-                            'snd10': snd_data.get('snd10', None),
-                            'snd25': snd_data.get('snd25', None),
-                            'snd50': snd_data.get('snd50', None),
-                            "queried_by_verb": 1 if verb is not None else 0,
-                            "queried_by_noun": 1 if noun is not None else 0,
-                        }
-
-                        kwics_record = {
-                            'verb': _verb,
-                            'noun': _noun,
-                            'kwics': kwics_list,
-                            'kwic_words': kwic_words_list,
-                        }
+                    pair_key = f"{_verb} {_noun}"
                     
-                        comprehensive_data[f"{_verb} {_noun}"] = record
-                        verb_noun_count += 1
-                        
-                        # Store KWICs in JSON
-                        kwics_json[f"{_verb} {_noun}"] = kwics_record
+                    # Skip if already processed (from checkpoint)
+                    if pair_key in comprehensive_data:
+                        # Just update query flags if needed
+                        if verb is not None:
+                            comprehensive_data[pair_key]['queried_by_verb'] = 1
+                        elif noun is not None:
+                            comprehensive_data[pair_key]['queried_by_noun'] = 1
+                        continue
+                    
+                    # FILTER 1: Skip nouns less than 3 characters
+                    if len(_noun) < 3:
+                        total_filtered_out += 1
+                        continue
+                    
+                    kwics_list = group["kwics"].tolist()
+                    kwic_words_list = group["kwic_words"].tolist()
+                    
+                    # Skip if we don't have enough KWICs
+                    if len(kwics_list) != n_kwics:
+                        total_filtered_out += 1
+                        continue
+                    
+                    # Get word sketch data for this verb-noun pair
+                    ws_data = get_word_sketch_data(_verb, _noun)
+                    
+                    # Get concreteness for noun using existing utility function
+                    noun_concreteness = get_concreteness_rating(_noun)
+                    
+                    # FILTER 2: Reject words if concreteness is not available (likely slang/informal)
+                    if noun_concreteness is None or pd.isna(noun_concreteness):
+                        total_filtered_out += 1
+                        continue
+                    
+                    # Get SND metrics for noun
+                    snd_data = snd_dict.get(_noun.lower(), {})
+                    
+                    # Get synset lengths from WordNet
+                    noun_synset_len = get_len_synset(_noun, pos=wn.NOUN)
+                    verb_synset_len = get_len_synset(_verb, pos=wn.VERB)
+                    
+                    # Create comprehensive record
+                    record = {
+                        'verb': _verb,
+                        'noun': _noun,
+                        'item': f"{_verb} {_noun}",
+                        'n_kwics': len(kwics_list),
+                        'coll_freq': ws_data['coll_freq'],
+                        'logDice': ws_data['logDice'],
+                        'usage': ws_data['usage'],
+                        'noun_concreteness': noun_concreteness,
+                        'noun_synset_len': noun_synset_len,
+                        'verb_synset_len': verb_synset_len,
+                        'snd3': snd_data.get('snd3', None),
+                        'snd10': snd_data.get('snd10', None),
+                        'snd25': snd_data.get('snd25', None),
+                        'snd50': snd_data.get('snd50', None),
+                        "queried_by_verb": 1 if verb is not None else 0,
+                        "queried_by_noun": 1 if noun is not None else 0,
+                    }
+
+                    kwics_record = {
+                        'verb': _verb,
+                        'noun': _noun,
+                        'kwics': kwics_list,
+                        'kwic_words': kwic_words_list,
+                    }
+                
+                    comprehensive_data[pair_key] = record
+                    verb_noun_count += 1
+                    
+                    # Store KWICs in JSON
+                    kwics_json[pair_key] = kwics_record
             
-            print(f"{_verb}: {verb_noun_count} noun pairs with {n_kwics} KWICs each")
+            # Mark this verb/noun as processed
+            processed_items.add(item_key)
+            items_processed_since_checkpoint += 1
+            
+            # Save checkpoint periodically (after processing each verb/noun)
+            if items_processed_since_checkpoint >= checkpoint_freq:
+                save_checkpoint()
+                items_processed_since_checkpoint = 0
         
         except Exception as e:
-            print(f"Error processing {_verb}: {str(e)}")
+            print(f"  ✗ Error processing {verb} {noun}: {str(e)}")
             continue
+    
+    # Final checkpoint save before finishing
+    print(f"\n{'='*80}")
+    print(f"EXTRACTION COMPLETE")
+    print(f"{'='*80}")
+    print(f"  Items processed: {len(processed_items)}")
+    print(f"  Pairs collected: {len(comprehensive_data)}")
+    print(f"  Pairs filtered: {total_filtered_out}")
+    
+    if items_processed_since_checkpoint > 0:
+        save_checkpoint()
     
     # Convert to DataFrame and add noun count per verb
     if not comprehensive_data:
@@ -222,35 +293,46 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
     # Sort by verb and noun
     result_df = result_df.sort_values(['verb', 'noun']).reset_index(drop=True)
     
-    # Save outputs. save all queried by verb to one CSV, and all queried by noun to another CSV
-    print(f"\nSaving {len(result_df)} verb-noun pairs to CSV...")
+    # Save outputs
+    print(f"\n{'='*80}")
+    print(f"SAVING OUTPUTS")
+    print(f"{'='*80}")
+    
     result_df[result_df['queried_by_verb'] == 1].to_csv(output_csv.replace(".csv", "_queried_by_verb.csv"), index=False)
     result_df[result_df['queried_by_noun'] == 1].to_csv(output_csv.replace(".csv", "_queried_by_noun.csv"), index=False)
     result_df.to_csv(output_csv, index=False)
-    print(f"Saved to: {output_csv}")
+    print(f"  ✓ CSV saved: {output_csv}")
     
-    print(f"\nSaving raw KWICs to JSON...")
     with open(output_json, 'w', encoding='utf-8') as f:
         json.dump(kwics_json, f, ensure_ascii=False, indent=2)
-    print(f"Saved to: {output_json}")
+    print(f"  ✓ JSON saved: {output_json}")
     
     # Clean up checkpoint on successful completion
     if checkpoint_file.exists():
         checkpoint_file.unlink()
-        print(f"\nCheckpoint file deleted (extraction completed successfully)")
+        print(f"  ✓ Checkpoint deleted")
     
-    # Print summary statistics
+# print summary of results filter queried by verb 
     print(f"\n{'='*80}")
-    print("SUMMARY STATISTICS")
+    print(f"SUMMARY BY VERB")
     print(f"{'='*80}")
-    print(f"Total unique verbs: {result_df['verb'].nunique()}")
-    print(f"Total verb-noun pairs: {len(result_df)}")
-    print(f"Total KWICs: {len(result_df) * n_kwics}")
-    print(f"\nNouns per verb:")
-    print(result_df.groupby('verb')['n_nouns_for_verb'].first().describe())
-    print(f"\nMissing values:")
-    print(result_df.isnull().sum())
+    queried_by_verb = result_df[result_df['queried_by_verb'] == 1]
+    print(f"  Verbs queried: {queried_by_verb['verb'].nunique()}")
+    print(f"  Mean pairs per verb: {queried_by_verb.groupby('verb').size().mean():.1f}")
+
+        # print summary of results filter queried by noun
+    print(f"\n{'='*80}")
+    print(f"SUMMARY BY NOUN")
+    print(f"{'='*80}")
+    queried_by_noun = result_df[result_df['queried_by_noun'] == 1]
+    print(f"  Nouns queried: {queried_by_noun['noun'].nunique()}")
+    print(f"  Mean pairs per noun: {queried_by_noun.groupby('noun').size().mean():.1f}")
+
 
 
 if __name__ == "__main__":
     build_dataset()
+
+
+# To run this script, use the command line with appropriate arguments, for example:
+# uv run python build_comprehensive_kwic_dataset.py -i stimuli.csv -o data/processed/comprehensive_kwic_dataset.csv -j data/processed/comprehensive_kwic_dataset.json --verbs "kick,kill" --nouns "ball,bunny" --checkpoint-freq 1
