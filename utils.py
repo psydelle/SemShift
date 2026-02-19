@@ -367,7 +367,7 @@ def get_vn_kwics(
             )
             if not vn_kwics:
                 continue
-            time.sleep(4) # SketchEngine timeout mitigation :(
+            time.sleep(10) # SketchEngine timeout mitigation :(
             kwics.extend(vn_kwics)
             kwic_words.extend(vn_kwic_words)
             verb_noun_pairs.extend([(_verb, _noun)] * len(vn_kwics))

@@ -267,7 +267,7 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
         
         except Exception as e:
             print(f"  ✗ Error processing {verb} {noun}: {str(e)}")
-            continue
+            raise
     
     # Final checkpoint save before finishing
     print(f"\n{'='*80}")
