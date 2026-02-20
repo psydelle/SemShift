@@ -258,16 +258,16 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
             
             # Mark this verb/noun as processed
             processed_items.add(item_key)
-            items_processed_since_checkpoint += 1
+            # items_processed_since_checkpoint += 1
             
             # Save checkpoint periodically (after processing each verb/noun)
-            if items_processed_since_checkpoint >= checkpoint_freq:
-                save_checkpoint()
-                items_processed_since_checkpoint = 0
+            save_checkpoint()
+            # if items_processed_since_checkpoint >= checkpoint_freq:
+            #     items_processed_since_checkpoint = 0
         
         except Exception as e:
             print(f"  ✗ Error processing {verb} {noun}: {str(e)}")
-            raise
+            raise e
     
     # Final checkpoint save before finishing
     print(f"\n{'='*80}")
@@ -277,8 +277,8 @@ def build_dataset(input_csv, output_csv, output_json, n_kwics, n_ctx_sentences, 
     print(f"  Pairs collected: {len(comprehensive_data)}")
     print(f"  Pairs filtered: {total_filtered_out}")
     
-    if items_processed_since_checkpoint > 0:
-        save_checkpoint()
+    # if items_processed_since_checkpoint > 0:
+    save_checkpoint()
     
     # Convert to DataFrame and add noun count per verb
     if not comprehensive_data:
