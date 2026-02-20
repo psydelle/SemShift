@@ -35,7 +35,7 @@ _nlp = None
 def get_nlp():
     global _nlp
     if _nlp is None:
-        _nlp = spacy.load("en_core_web_sm")
+        _nlp = spacy.load("en_core_web_sm")# , enable=["tokenizer", "tagger", "parser", "lemmatizer", "attribute_ruler", "morphologizer"])
     return _nlp
 
 
@@ -402,46 +402,49 @@ def get_vn_kwics(
     return df
 
 
-def _check_syntax(text, verb_lemma, noun_lemma):
+def _check_syntax(text_batch, verb_lemma, noun_lemma):
     """
     Check if verb and noun have valid syntactic relationship.
     Only accepts object relationships (direct object, indirect object, passive subject).
     Returns True if valid, False otherwise.
     """
     nlp = get_nlp()
-    doc = nlp(text)
+    docs = nlp.pipe(text_batch, disable=["ner"], n_process=-1)
     
-    # Find all verb and noun tokens
-    verb_tokens = [t for t in doc if t.lemma_ == verb_lemma and t.pos_ == "VERB"]
-    noun_tokens = [t for t in doc if t.lemma_ == noun_lemma and t.pos_ in {"NOUN", "PROPN"}]
-    
-    if not verb_tokens or not noun_tokens:
+    def filter_doc(doc):
+        # Find all verb and noun tokens
+        verb_tokens = [t for t in doc if t.lemma_ == verb_lemma and t.pos_ == "VERB"]
+        noun_tokens = [t for t in doc if t.lemma_ == noun_lemma and t.pos_ in {"NOUN", "PROPN"}]
+        
+        if not verb_tokens or not noun_tokens:
+            return False
+        
+        # Check each verb-noun pair for valid syntactic relationships
+        for verb_tok in verb_tokens:
+            for noun_tok in noun_tokens:
+                # Skip uppercase nouns
+                if not noun_tok.text.islower():
+                    continue
+                
+                # Check distance constraint
+                if abs(noun_tok.i - verb_tok.i) > 10:
+                    continue
+                
+                # Direct dependency: noun as object of verb
+                if noun_tok.head == verb_tok:
+                    # Only accept object relations (direct, indirect) and passive subjects
+                    if noun_tok.dep_ in {"dobj", "obj", "iobj", "nsubjpass"}:
+                        return True
+                
+                # Verb in relative clause modifying noun (e.g., "the ball that was kicked")
+                # Here the noun is still semantically the object of the verb
+                if verb_tok.head == noun_tok:
+                    if verb_tok.dep_ in {"relcl", "acl"}:
+                        return True
+        
         return False
     
-    # Check each verb-noun pair for valid syntactic relationships
-    for verb_tok in verb_tokens:
-        for noun_tok in noun_tokens:
-            # Skip uppercase nouns
-            if not noun_tok.text.islower():
-                continue
-            
-            # Check distance constraint
-            if abs(noun_tok.i - verb_tok.i) > 10:
-                continue
-            
-            # Direct dependency: noun as object of verb
-            if noun_tok.head == verb_tok:
-                # Only accept object relations (direct, indirect) and passive subjects
-                if noun_tok.dep_ in {"dobj", "obj", "iobj", "nsubjpass"}:
-                    return True
-            
-            # Verb in relative clause modifying noun (e.g., "the ball that was kicked")
-            # Here the noun is still semantically the object of the verb
-            if verb_tok.head == noun_tok:
-                if verb_tok.dep_ in {"relcl", "acl"}:
-                    return True
-    
-    return False
+    return [text for doc, text in zip(docs, text_batch) if filter_doc(doc)]
 
 
 def _get_kwics_from_query(
@@ -487,7 +490,7 @@ def _get_kwics_from_query(
             if not lines:
                 break  # No more results available
 
-            yield from lines
+            yield lines
 
     clean_lines = []
     kwic_words = []
@@ -497,66 +500,72 @@ def _get_kwics_from_query(
     filtered_syntax = 0
     filtered_other = 0
     
-    for line in get_data():
-        total_processed += 1
+    for lines in get_data():
+
+        clean_lines_batch = []
+        kwic_words_batch = []
         
-        # filter "strc", like sentence breaks
-        left = [x["str"] for x in line["Left"] if "str" in x]
-        right = [x["str"] for x in line["Right"] if "str" in x]
+        for line in lines:
+            total_processed += 1
+            # filter "strc", like sentence breaks
+            left = [x["str"] for x in line["Left"] if "str" in x]
+            right = [x["str"] for x in line["Right"] if "str" in x]
 
-        if not is_fallback:
-            assert len(line["Kwic"]) == 1, f"Expected only one kwic, got {line['Kwic']}"
-            kwic = line["Kwic"][0]["str"]
-            # grab collocate from context corresponding to collocate_position
-            # it will be the first element which has the "coll": 1 key
-            _coll_context = line["Right"] if collocate_position == "right" else line["Left"]
-            kwic2 = next((x["str"] for x in _coll_context if "coll" in x), None)
-            
-            if kwic2 is None:
+            if not is_fallback:
+                assert len(line["Kwic"]) == 1, f"Expected only one kwic, got {line['Kwic']}"
+                kwic = line["Kwic"][0]["str"]
+                # grab collocate from context corresponding to collocate_position
+                # it will be the first element which has the "coll": 1 key
+                _coll_context = line["Right"] if collocate_position == "right" else line["Left"]
+                kwic2 = next((x["str"] for x in _coll_context if "coll" in x), None)
+                
+                if kwic2 is None:
+                    filtered_other += 1
+                    continue  # skip if collocate not in correct context (inverted order)
+
+                if kwic == kwic2:
+                    filtered_other += 1
+                    continue  # skip if same word
+
+                if not kwic.isalnum() or not kwic2.isalnum():
+                    filtered_other += 1
+                    continue  # skip if not alnum
+
+                full_clean = left + [kwic] + right
+
+                if collocate_position == "left":
+                    kwic, kwic2 = kwic2, kwic  # swap to maintain verb-noun order
+            else:
+                raise NotImplementedError("IDK what this does anymore")
+                kwic_str = [x["str"] for x in line["Kwic"] if "str" in x]
+                if not all([x.isalnum() for x in kwic_str]):
+                    filtered_other += 1
+                    continue  # skip if not alnum
+                kwic, kwic2 = kwic_str[0], kwic_str[-1]
+                full_clean = left + kwic_str + right
+
+            if len(full_clean) > max_word_count:
                 filtered_other += 1
-                continue  # skip if collocate not in correct context (inverted order)
+                continue  # skip if too many words
 
-            if kwic == kwic2:
+            expected_kwic_in_left = 1 if collocate_position == "left" else 0
+
+            if left.count(kwic) != expected_kwic_in_left:
                 filtered_other += 1
-                continue  # skip if same word
+                continue  # more than one instance of the verb appears in the left context
 
-            if not kwic.isalnum() or not kwic2.isalnum():
-                filtered_other += 1
-                continue  # skip if not alnum
+            clean_line = " ".join(full_clean)
+            clean_lines_batch.append(clean_line)
+            kwic_words_batch.append((kwic, kwic2))
 
-            full_clean = left + [kwic] + right
-
-            if collocate_position == "left":
-                kwic, kwic2 = kwic2, kwic  # swap to maintain verb-noun order
-        else:
-            raise NotImplementedError("IDK what this does anymore")
-            kwic_str = [x["str"] for x in line["Kwic"] if "str" in x]
-            if not all([x.isalnum() for x in kwic_str]):
-                filtered_other += 1
-                continue  # skip if not alnum
-            kwic, kwic2 = kwic_str[0], kwic_str[-1]
-            full_clean = left + kwic_str + right
-
-        if len(full_clean) > max_word_count:
-            filtered_other += 1
-            continue  # skip if too many words
-
-        expected_kwic_in_left = 1 if collocate_position == "left" else 0
-
-        if left.count(kwic) != expected_kwic_in_left:
-            filtered_other += 1
-            continue  # more than one instance of the verb appears in the left context
-
-        clean_line = " ".join(full_clean)
-        
         # Apply syntactic filtering if enabled
         if use_syntax_filter:
-            if not _check_syntax(clean_line, verb_lemma, noun_lemma):
-                filtered_syntax += 1
-                continue  # Skip if syntax is invalid
+            before_syntax_count = len(clean_lines_batch)
+            clean_lines_batch = _check_syntax(clean_lines_batch, verb_lemma, noun_lemma)
+            filtered_syntax += before_syntax_count - len(clean_lines_batch) # count how many were filtered out by syntax
         
-        clean_lines.append(clean_line)
-        kwic_words.append((kwic, kwic2))
+        clean_lines.extend(clean_lines_batch)
+        kwic_words.extend(kwic_words_batch)
         if len(clean_lines) >= n_kwics:
             break
     
@@ -565,7 +574,10 @@ def _get_kwics_from_query(
         print(f"  Filtering stats: {total_processed} processed, {filtered_syntax} rejected by syntax, {filtered_other} rejected by other filters, {len(clean_lines)} kept")
 
     # keep first N kwics under max_word_count
-    if len(clean_lines) != n_kwics:
+    if len(clean_lines) > n_kwics:
+        clean_lines = clean_lines[:n_kwics]
+        kwic_words = kwic_words[:n_kwics]
+    elif len(clean_lines) < n_kwics:
         print("Only", len(clean_lines), "KWICs obtained for", query)
         return None, None
 
