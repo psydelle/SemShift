@@ -6,20 +6,22 @@
 
 
 # import the necessary libraries -------------------------------------------------------------#
-import re
-from typing import List, Tuple
-from nltk.corpus import wordnet as wn
-import pandas as pd
-import json
-from tqdm import tqdm
-import click
-import os
-import time
-from dotenv import load_dotenv
-import requests as r
 import functools
-import spacy
+import json
+import os
+import re
+import threading
+import time
+from collections import deque
+from typing import List, Tuple
 
+import click
+import pandas as pd
+import requests as r
+import spacy
+from dotenv import load_dotenv
+from nltk.corpus import wordnet as wn
+from tqdm import tqdm
 
 # load the environment variables
 load_dotenv()  # take environment variables from .env.
@@ -120,7 +122,7 @@ def get_word_freq(
     # print the frequency
     print(f"The frequency of {word} as a {pos} is {freq}")
 
-    time.sleep(4)  # SketchEngine timeout mitigation :(
+    # time.sleep(4)  # SketchEngine timeout mitigation :(
     # return the frequency
     return freq
 
@@ -145,22 +147,7 @@ def get_word_sketch(
     Returns:
         ws (dict): dictionary with the word sketch data
     """
-    data = {
-        "corpname": corpus,
-        "format": "json",
-        "lemma": node,
-        "lpos": "-v",
-        "sort_gramrels": 1,
-        "maxitems": 200,
-        "sort_ws_columns": "f",
-        # "expand_seppage": 1,
-    }
-    # get the data from the API
-    d = r.get(
-        base_url + "/wsketch",
-        params=data,
-        auth=(username, api_key),
-    ).json()
+    d = get_ws(corpus, node, pos="-v", max_items=200)
 
     # create an empty dictionary to store the wordsketch data
     ws = {}
@@ -185,47 +172,98 @@ def get_word_sketch(
             # get tt key values from High
             ws["Context"] = entry["High"]
             break  # stop the loop when we find the entry we want
-        # if we cannot find the collocate,
-        # set the values to None and we'll deal with it manually
-        else:
-            ws["Verb"] = node
-            ws["Noun"] = collocate
-            ws["CollFreq"] = "Not found"
-            ws["Score"] = "Not found"
-            ws["Usage"] = "Not found"
-            ws["Context"] = "Not found"
+    # if we cannot find the collocate,
+    # set the values to None and we'll deal with it manually
+    else:
+        ws["Verb"] = node
+        ws["Noun"] = collocate
+        ws["CollFreq"] = "Not found"
+        ws["Score"] = "Not found"
+        ws["Usage"] = "Not found"
+        ws["Context"] = "Not found"
 
-    time.sleep(1)  # SketchEngine timeout mitigation:(
+    # time.sleep(1)  # SketchEngine timeout mitigation:(
     # return the dictionary
     return ws
 
 
-def get_ws_data(verb, noun, data: str = "coll_freq"):
-    """
-    Function to get the collocation frequency of a verb and noun from the SketchEngine API
-    Args:
-        verb (str): verb to get the collocation frequency of
-        noun (str): noun to get the collocation frequency of
-    Returns:
-        coll_data["freq"] (int): frequency of the collocation
-    """
-
-    coll_data = get_word_sketch(verb, noun)
-    if data == "coll_freq":
-        return coll_data["CollFreq"]
-    elif data == "score":
-        return coll_data["Score"]
-    elif data == "usage":
-        return coll_data["Usage"]
-    elif data == "context":
-        return coll_data["Context"]
-    else:
-        raise ValueError(
-            "Invalid data type. Please choose from 'coll_freq', 'score', 'usage', or 'context'."
-        )
-
-
 # ---------------------------------------------------------------------------------------------#
+
+
+class RateLimiter:
+    """
+    Multi-window sliding rate limiter.
+
+    Enforces:
+        - 100 requests per 60 seconds
+        - 900 requests per 3600 seconds
+        - 2000 requests per 86400 seconds
+
+    Uses timestamp deques to track request history.
+    Thread-safe via a single lock.
+    """
+
+    def __init__(self):
+        # Store timestamps (epoch seconds) of previous calls
+        self.minute = deque()
+        self.hour = deque()
+        self.day = deque()
+
+        # Mutex to ensure thread safety
+        self.lock = threading.Lock()
+
+        # (max_requests, window_in_seconds+1)
+        self.minute_limit = (100, 61, "minute")
+        self.hour_limit = (900, 3601, "hour")
+        self.day_limit = (2000, 86401, "day")
+
+    def _wait(self, queue, limit, window, window_name):
+        """
+        Enforces a single rate window.
+
+        Args:
+            queue (deque): Timestamp history for the window
+            limit (int): Maximum allowed requests in the window
+            window (int): Window duration in seconds
+        """
+        now = time.time()
+
+        # Remove timestamps that are older than the window
+        # These requests no longer count toward the rate limit
+        while queue and queue[0] <= now - window:
+            queue.popleft()
+
+        # If we are at or above the allowed limit,
+        # compute how long until the oldest request expires
+        if len(queue) >= limit:
+            # Time remaining before the oldest timestamp exits the window
+            sleep_for = window - (now - queue[0])
+
+            if sleep_for > 0:
+                print(f"Rate limit reached for {window_name}. Sleeping for {sleep_for:.2f} seconds...")
+                time.sleep(sleep_for)
+
+    def acquire(self):
+        """
+        Blocks execution until all rate limits allow a new request.
+        Then records the request timestamp in all windows.
+        """
+        with self.lock:  # Prevent race conditions between threads
+
+            # Enforce each independent time window
+            self._wait(self.minute, *self.minute_limit)
+            self._wait(self.hour, *self.hour_limit)
+            self._wait(self.day, *self.day_limit)
+
+            # Record current request timestamp after waiting
+            now = time.time()
+            self.minute.append(now)
+            self.hour.append(now)
+            self.day.append(now)
+
+
+# Instantiate a global limiter
+limiter = RateLimiter()
 
 
 def _get_request(url, params):
@@ -237,6 +275,8 @@ def _get_request(url, params):
     Returns:
         response.json() (dict): dictionary with the data from the API
     """
+    limiter.acquire()
+
     try:
         response = r.get(url, params=params, auth=(USERNAME, API_KEY))
         response.raise_for_status()  # Check for any request errors
@@ -245,6 +285,7 @@ def _get_request(url, params):
     return response.json()
 
 
+@functools.cache
 def get_ws(corpus_name: str, word: str, pos="-v", max_items=200):
     """
     Function to get the word sketch of a word from the SketchEngine API
@@ -264,6 +305,7 @@ def get_ws(corpus_name: str, word: str, pos="-v", max_items=200):
         "maxitems": max_items,
         "structured": 1,
         "minfreq": 1,
+        "sort_ws_columns": "f",
     }
     sketch_data = _get_request(BASE_URL + "/wsketch?corpname=%s" % data["corpname"], data)
     return sketch_data
@@ -320,6 +362,7 @@ def get_corp_info(corpus_name):
 
 
 # For KWICS from Sketch Engine -----------------------------------------------------------------#
+@functools.cache
 def get_vn_kwics(
     corpus_name,
     verb=None,
@@ -367,7 +410,7 @@ def get_vn_kwics(
             )
             if not vn_kwics:
                 continue
-            time.sleep(10) # SketchEngine timeout mitigation :(
+            # time.sleep(10) # SketchEngine timeout mitigation :(
             kwics.extend(vn_kwics)
             kwic_words.extend(vn_kwic_words)
             verb_noun_pairs.extend([(_verb, _noun)] * len(vn_kwics))
@@ -410,40 +453,40 @@ def _check_syntax(text_batch, verb_lemma, noun_lemma):
     """
     nlp = get_nlp()
     docs = nlp.pipe(text_batch, disable=["ner"], n_process=-1)
-    
+
     def filter_doc(doc):
         # Find all verb and noun tokens
         verb_tokens = [t for t in doc if t.lemma_ == verb_lemma and t.pos_ == "VERB"]
         noun_tokens = [t for t in doc if t.lemma_ == noun_lemma and t.pos_ in {"NOUN", "PROPN"}]
-        
+
         if not verb_tokens or not noun_tokens:
             return False
-        
+
         # Check each verb-noun pair for valid syntactic relationships
         for verb_tok in verb_tokens:
             for noun_tok in noun_tokens:
                 # Skip uppercase nouns
                 if not noun_tok.text.islower():
                     continue
-                
+
                 # Check distance constraint
                 if abs(noun_tok.i - verb_tok.i) > 10:
                     continue
-                
+
                 # Direct dependency: noun as object of verb
                 if noun_tok.head == verb_tok:
                     # Only accept object relations (direct, indirect) and passive subjects
                     if noun_tok.dep_ in {"dobj", "obj", "iobj", "nsubjpass"}:
                         return True
-                
+
                 # Verb in relative clause modifying noun (e.g., "the ball that was kicked")
                 # Here the noun is still semantically the object of the verb
                 if verb_tok.head == noun_tok:
                     if verb_tok.dep_ in {"relcl", "acl"}:
                         return True
-        
+
         return False
-    
+
     return [text for doc, text in zip(docs, text_batch) if filter_doc(doc)]
 
 
@@ -461,7 +504,7 @@ def _get_kwics_from_query(
 ):
     is_fallback = ws_seek_query is None
     query = ws_seek_query if not is_fallback else reg_query
-    
+
     # Enable syntax filtering if both verb and noun lemmas are provided
     use_syntax_filter = verb_lemma is not None and noun_lemma is not None
 
@@ -486,7 +529,7 @@ def _get_kwics_from_query(
             }
             kwics_data = _get_request(BASE_URL + "/concordance", data)
             lines = kwics_data.get("Lines", [])
-            
+
             if not lines:
                 break  # No more results available
 
@@ -494,17 +537,17 @@ def _get_kwics_from_query(
 
     clean_lines = []
     kwic_words = []
-    
+
     # Tracking statistics
     total_processed = 0
     filtered_syntax = 0
     filtered_other = 0
-    
+
     for lines in get_data():
 
         clean_lines_batch = []
         kwic_words_batch = []
-        
+
         for line in lines:
             total_processed += 1
             # filter "strc", like sentence breaks
@@ -518,7 +561,7 @@ def _get_kwics_from_query(
                 # it will be the first element which has the "coll": 1 key
                 _coll_context = line["Right"] if collocate_position == "right" else line["Left"]
                 kwic2 = next((x["str"] for x in _coll_context if "coll" in x), None)
-                
+
                 if kwic2 is None:
                     filtered_other += 1
                     continue  # skip if collocate not in correct context (inverted order)
@@ -563,12 +606,12 @@ def _get_kwics_from_query(
             before_syntax_count = len(clean_lines_batch)
             clean_lines_batch = _check_syntax(clean_lines_batch, verb_lemma, noun_lemma)
             filtered_syntax += before_syntax_count - len(clean_lines_batch) # count how many were filtered out by syntax
-        
+
         clean_lines.extend(clean_lines_batch)
         kwic_words.extend(kwic_words_batch)
         if len(clean_lines) >= n_kwics:
             break
-    
+
     # Report filtering statistics
     if use_syntax_filter and total_processed > 0:
         print(f"  Filtering stats: {total_processed} processed, {filtered_syntax} rejected by syntax, {filtered_other} rejected by other filters, {len(clean_lines)} kept")

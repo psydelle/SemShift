@@ -35,7 +35,7 @@ def process_line(line, **kwargs):
     p = process_item(line, **kwargs)
     if p.empty:
         print("No KWICS found for", line["verb"], line["noun"])
-    time.sleep(10)  # Mitigate SketchEngine API rate limits
+    # time.sleep(10)  # Mitigate SketchEngine API rate limits
     return p
 
 # Helper function to load an existing JSON file or start fresh if corrupted/missing
