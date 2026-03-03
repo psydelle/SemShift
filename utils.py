@@ -266,7 +266,7 @@ class RateLimiter:
 limiter = RateLimiter()
 
 
-def _get_request(url, params):
+def _get_request(url, params, retry_backoff=60):
     """
     Function to make a GET request to the SketchEngine API
     Args:
@@ -282,6 +282,12 @@ def _get_request(url, params):
         response.raise_for_status()  # Check for any request errors
     except r.exceptions.RequestException as e:
         print("Error occurred during the request:", str(e))
+        if response.status_code == 429:
+            print(f"Received 429 Too Many Requests. Backing off and retrying in {retry_backoff} seconds.")
+            time.sleep(retry_backoff)
+            return _get_request(url, params, retry_backoff=retry_backoff*2)  # Retry the request after sleeping
+        else:
+            raise  # For other types of exceptions, re-raise the error
     return response.json()
 
 
