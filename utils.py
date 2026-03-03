@@ -409,7 +409,11 @@ def get_vn_kwics(
                 noun_lemma=_noun,
             )
             if not vn_kwics:
+                print(f"No KWICs found for {_verb} and {_noun} with seek id {seek_id}")
                 continue
+            elif len(vn_kwics) < n_kwics:
+                print(f"Only got {len(vn_kwics)} KWICs for {_verb} and {_noun} with seek id {seek_id}, expected {n_kwics}")
+
             # time.sleep(10) # SketchEngine timeout mitigation :(
             kwics.extend(vn_kwics)
             kwic_words.extend(vn_kwic_words)
@@ -449,7 +453,7 @@ def _check_syntax(text_batch, verb_lemma, noun_lemma):
     """
     Check if verb and noun have valid syntactic relationship.
     Only accepts object relationships (direct object, indirect object, passive subject).
-    Returns True if valid, False otherwise.
+    Returns a list of booleans indicating whether each sentence in the batch is valid.
     """
     nlp = get_nlp()
     docs = nlp.pipe(text_batch, disable=["ner"], n_process=-1)
@@ -487,7 +491,7 @@ def _check_syntax(text_batch, verb_lemma, noun_lemma):
 
         return False
 
-    return [text for doc, text in zip(docs, text_batch) if filter_doc(doc)]
+    return [filter_doc(doc) for doc in docs]
 
 
 def _get_kwics_from_query(
@@ -603,9 +607,10 @@ def _get_kwics_from_query(
 
         # Apply syntactic filtering if enabled
         if use_syntax_filter:
-            before_syntax_count = len(clean_lines_batch)
-            clean_lines_batch = _check_syntax(clean_lines_batch, verb_lemma, noun_lemma)
-            filtered_syntax += before_syntax_count - len(clean_lines_batch) # count how many were filtered out by syntax
+            is_valid = _check_syntax(clean_lines_batch, verb_lemma, noun_lemma)
+            clean_lines_batch = [line for line, valid in zip(clean_lines_batch, is_valid) if valid]
+            kwic_words_batch = [kw for kw, valid in zip(kwic_words_batch, is_valid) if valid]
+            filtered_syntax += len(is_valid) - sum(is_valid) # count how many were filtered out by syntax
 
         clean_lines.extend(clean_lines_batch)
         kwic_words.extend(kwic_words_batch)
@@ -621,7 +626,7 @@ def _get_kwics_from_query(
         clean_lines = clean_lines[:n_kwics]
         kwic_words = kwic_words[:n_kwics]
     elif len(clean_lines) < n_kwics:
-        print("Only", len(clean_lines), "KWICs obtained for", query)
+        print("  Only", len(clean_lines), "KWICs obtained for", query)
         return None, None
 
     return clean_lines, kwic_words
