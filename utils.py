@@ -368,7 +368,7 @@ def get_corp_info(corpus_name):
 
 
 # For KWICS from Sketch Engine -----------------------------------------------------------------#
-@functools.cache
+# @functools.cache
 def get_vn_kwics(
     corpus_name,
     verb=None,
