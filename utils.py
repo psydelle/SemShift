@@ -84,51 +84,8 @@ def clean_sentence(sentence: str) -> str:
 
 
 # Functions to get Sketch Engine Data --------------------------------------------------------#
-@functools.cache
-def get_word_freq(
-    word: str,
-    pos: str,
-    corpus=CORPUS,
-    base_url=BASE_URL,
-    username=USERNAME,  # set your username
-    api_key=API_KEY,  # set your API key, you can find it in your profile on SketchEngine
-):
-    """Function to get the frequency of a word from the SketchEngine API
-    Args:
-        word (str): word to get the frequency of
-        pos (str): part of speech tag of the word
-        corpus (str): name of the corpus
-        base_url (str): base url of the SketchEngine API
-        USERNAME (str): username
-        API_KEY (str): API key
-        n_gram (bool): whether we want to get the frequency of an n-gram or a unigram
-    Returns:
-        freq (int): frequency of the word
-    """
-    data = {
-        "corpname": corpus,
-        "format": "json",
-        "lemma": word,
-        "lpos": pos,
-    }
-    # get the data from the API
-    d = r.get(
-        base_url + "/wsketch?corpname=%s" % data["corpname"],
-        params=data,
-        auth=(username, api_key),
-    ).json()
-    # get the frequency
-    freq = d["freq"]
-    # print the frequency
-    print(f"The frequency of {word} as a {pos} is {freq}")
-
-    # time.sleep(4)  # SketchEngine timeout mitigation :(
-    # return the frequency
-    return freq
-
-
 # create a function to get the word sketch of a word and return important data
-def get_word_sketch(
+def get_vn_wordsketch(
     node: str,  # for our experiment, this is the verb
     collocate: str,  # for our experiment, this is the noun (Direct Object)
     corpus=CORPUS,
@@ -147,7 +104,7 @@ def get_word_sketch(
     Returns:
         ws (dict): dictionary with the word sketch data
     """
-    d = get_ws(corpus, node, pos="-v", max_items=200)
+    d = get_simple_wordsketch(corpus, node, pos="-v", max_items=200)
 
     # create an empty dictionary to store the wordsketch data
     ws = {}
@@ -290,9 +247,9 @@ def _get_request(url, params, retry_backoff=60):
             raise  # For other types of exceptions, re-raise the error
     return response.json()
 
-
-@functools.cache
-def get_ws(corpus_name: str, word: str, pos="-v", max_items=200):
+# Cache results to avoid redundant API calls. Maxsize is small because consecutive calls are likely to be for the same word.
+@functools.lru_cache(maxsize=3)
+def get_simple_wordsketch(corpus_name: str, word: str, pos="-v", max_items=200):
     """
     Function to get the word sketch of a word from the SketchEngine API
     Args:
@@ -329,9 +286,10 @@ def get_verb_noun_sketch_seek_id(corpus_name, verb, noun) -> Tuple[List[dict], d
         sketch_data (dict): dictionary with the word sketch data
     """
     # get the wordsketch seek id
+    # TODO: dedupe wrt get_vn_wordsketch, which does the logic but for specific verb and noun
     if verb is None and noun is not None:
         # getting sketch for a noun
-        sketch_data = get_ws(corpus_name, noun, pos="-n")  # get noun sketch
+        sketch_data = get_simple_wordsketch(corpus_name, noun, pos="-n")  # get noun sketch
         for rel in sketch_data["Gramrels"]:
             if rel["name"] == 'verbs with "%w" as object':
                 coll_verbs = rel["Words"]
@@ -339,7 +297,7 @@ def get_verb_noun_sketch_seek_id(corpus_name, verb, noun) -> Tuple[List[dict], d
                 return colls, sketch_data
     else:
         # getting sketch for a verb (if noun is None), or a specific verb-noun combo (if noun is not None)
-        sketch_data = get_ws(corpus_name, verb, pos="-v")  # get verb sketch
+        sketch_data = get_simple_wordsketch(corpus_name, verb, pos="-v")  # get verb sketch
         for rel in sketch_data["Gramrels"]:
             if rel["name"] == 'objects of "%w"':  # get the objects of the verb
                 coll_nouns = rel["Words"]
@@ -368,7 +326,7 @@ def get_corp_info(corpus_name):
 
 
 # For KWICS from Sketch Engine -----------------------------------------------------------------#
-# @functools.cache
+# @functools.cache # TODO: figure out how not to get kwics twice when querying once by verb and once by noun
 def get_vn_kwics(
     corpus_name,
     verb=None,

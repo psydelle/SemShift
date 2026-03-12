@@ -13,7 +13,7 @@ import click
 from tqdm import tqdm
 from pathlib import Path
 from nltk.corpus import wordnet as wn
-from utils import get_vn_kwics, get_word_sketch, get_concreteness_rating, get_len_synset, load_snd_data
+from utils import get_vn_kwics, get_vn_wordsketch, get_concreteness_rating, get_len_synset, load_snd_data
 
 # Load environment variables
 from dotenv import load_dotenv
@@ -37,7 +37,7 @@ def load_existing_kwics(kwics_json_path):
 def get_word_sketch_data(verb, noun):
     """Get word sketch data for a verb-noun pair"""
     try:
-        ws_data = get_word_sketch(verb, noun, corpus=CORPUS)
+        ws_data = get_vn_wordsketch(verb, noun, corpus=CORPUS)
         return {
             'coll_freq': ws_data.get('CollFreq', None),
             'logDice': ws_data.get('Score', None),  # Score is logDice
