@@ -11,8 +11,8 @@ export PYTHONUNBUFFERED=1 # print everything immediately
 
 echo "Installing NLTK"
 uv run python -c "import nltk; nltk.download('wordnet')"
-# echo "Installing SpaCy"
-# uv run python -m spacy download en_core_web_sm
+echo "Installing SpaCy"
+uv run python -m spacy download en_core_web_sm
 
 # cd /workspace/SemShift
 
