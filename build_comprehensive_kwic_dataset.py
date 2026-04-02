@@ -21,19 +21,6 @@ load_dotenv()
 
 CORPUS = "preloaded/ententen21_tt31"
 
-
-def load_existing_kwics(kwics_json_path):
-    """Load existing KWICs from JSON file"""
-    try:
-        with open(kwics_json_path, 'r', encoding='utf-8') as f:
-            existing_kwics = json.load(f)
-        print(f"Loaded {len(existing_kwics)} existing KWIC entries from {kwics_json_path}")
-        return existing_kwics
-    except FileNotFoundError:
-        print(f"No existing KWICs file found at {kwics_json_path}")
-        return {}
-
-
 def get_word_sketch_data(verb, noun):
     """Get word sketch data for a verb-noun pair"""
     try:

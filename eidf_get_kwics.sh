@@ -16,6 +16,6 @@ uv run python -c "import nltk; nltk.download('wordnet')"
 
 cd /workspace/SemShift
 
-uv run python build_comprehensive_kwic_dataset.py -i stimuli.csv -o /pvc/SemShift/output.csv -j /pvc/SemShift/output.json --checkpoint-dir /pvc/SemShift/checkpoints --checkpoint-freq 10
+uv run python build_comprehensive_kwic_dataset.py -i stimuli.csv -o /pvc/SemShift/output.csv -j /pvc/SemShift/output.json --checkpoint-dir /pvc/SemShift/checkpoints --checkpoint-freq 10 --verbs ""
 
 echo "Done!"
