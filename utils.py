@@ -28,9 +28,14 @@ load_dotenv()  # take environment variables from .env.
 
 # set the corpus, username, API key
 CORPUS = "preloaded/ententen21_tt31"
-API_KEY = os.environ.get("SE_API_KEY")
-USERNAME = os.environ.get("SE_USERNAME")
 BASE_URL = "https://api.sketchengine.eu/bonito/run.cgi"
+
+# Support multiple comma-delimited credentials for key rotation
+_api_keys = [k.strip() for k in os.environ.get("SE_API_KEY", "").split(",") if k.strip()]
+_usernames = [u.strip() for u in os.environ.get("SE_USERNAME", "").split(",") if u.strip()]
+# Single-value aliases kept for backwards compatibility (e.g. function default args)
+API_KEY = _api_keys[0] if _api_keys else None
+USERNAME = _usernames[0] if _usernames else None
 
 # Lazy load spaCy model
 _nlp = None
@@ -149,7 +154,7 @@ def get_vn_wordsketch(
 
 class RateLimiter:
     """
-    Multi-window sliding rate limiter.
+    Multi-window sliding rate limiter for a single credential.
 
     Enforces:
         - 100 requests per 60 seconds
@@ -161,66 +166,121 @@ class RateLimiter:
     """
 
     def __init__(self):
-        # Store timestamps (epoch seconds) of previous calls
         self.minute = deque()
         self.hour = deque()
         self.day = deque()
-
-        # Mutex to ensure thread safety
         self.lock = threading.Lock()
-
-        # (max_requests, window_in_seconds+1)
+        # (max_requests, window_in_seconds+1, label)
         self.minute_limit = (100, 61, "minute")
         self.hour_limit = (900, 3601, "hour")
         self.day_limit = (2000, 86401, "day")
+        self.backoff_until = 0.0  # forced backoff end time (for 429 responses)
 
-    def _wait(self, queue, limit, window, window_name):
-        """
-        Enforces a single rate window.
+    def _windows(self):
+        return [
+            (self.minute, self.minute_limit),
+            (self.hour, self.hour_limit),
+            (self.day, self.day_limit),
+        ]
 
-        Args:
-            queue (deque): Timestamp history for the window
-            limit (int): Maximum allowed requests in the window
-            window (int): Window duration in seconds
-        """
+    def _prune(self, queue, window):
         now = time.time()
-
-        # Remove timestamps that are older than the window
-        # These requests no longer count toward the rate limit
         while queue and queue[0] <= now - window:
             queue.popleft()
 
-        # If we are at or above the allowed limit,
-        # compute how long until the oldest request expires
-        if len(queue) >= limit:
-            # Time remaining before the oldest timestamp exits the window
-            sleep_for = window - (now - queue[0])
+    def time_until_available(self):
+        """Return seconds until this limiter can accept a new request (0 = immediately)."""
+        with self.lock:
+            now = time.time()
+            forced = max(0.0, self.backoff_until - now)
+            waits = []
+            for queue, (limit, window, _) in self._windows():
+                self._prune(queue, window)
+                if len(queue) >= limit:
+                    waits.append(window - (now - queue[0]))
+            return max(forced, max(waits) if waits else 0.0)
 
-            if sleep_for > 0:
-                print(f"Rate limit reached for {window_name}. Sleeping for {sleep_for:.2f} seconds...")
-                time.sleep(sleep_for)
-
-    def acquire(self):
-        """
-        Blocks execution until all rate limits allow a new request.
-        Then records the request timestamp in all windows.
-        """
-        with self.lock:  # Prevent race conditions between threads
-
-            # Enforce each independent time window
-            self._wait(self.minute, *self.minute_limit)
-            self._wait(self.hour, *self.hour_limit)
-            self._wait(self.day, *self.day_limit)
-
-            # Record current request timestamp after waiting
+    def try_acquire(self):
+        """Non-blocking acquire. Records the request and returns True if a slot is available."""
+        with self.lock:
+            now = time.time()
+            if now < self.backoff_until:
+                return False
+            for queue, (limit, window, _) in self._windows():
+                self._prune(queue, window)
+                if len(queue) >= limit:
+                    return False
             now = time.time()
             self.minute.append(now)
             self.hour.append(now)
             self.day.append(now)
+            return True
+
+    def force_backoff(self, seconds):
+        """Mark this limiter unavailable for `seconds` seconds (e.g. after a 429)."""
+        with self.lock:
+            self.backoff_until = time.time() + seconds
 
 
-# Instantiate a global limiter
-limiter = RateLimiter()
+
+class CredentialPool:
+    """
+    Manages a pool of SketchEngine (username, api_key) credentials, each with its own
+    RateLimiter.  Rotates to the next available credential when the current one is
+    rate-limited, so requests are spread across all keys automatically.
+    """
+
+    def __init__(self, credentials):
+        """
+        Args:
+            credentials: list of (username, api_key) tuples.
+        """
+        if not credentials:
+            raise ValueError("No SketchEngine credentials found in SE_USERNAME / SE_API_KEY")
+        self.slots = [(u, k, RateLimiter()) for u, k in credentials]
+        self._lock = threading.Lock()
+        self._idx = 0  # round-robin cursor
+
+    def acquire(self):
+        """
+        Return (username, api_key) for the next available credential, blocking only
+        when every credential is rate-limited.  The pool lock is released before any
+        sleep so other threads are not starved.
+        """
+        while True:
+            sleep_for = 0.0
+            label = ""
+            with self._lock:
+                n = len(self.slots)
+                for i in range(n):
+                    idx = (self._idx + i) % n
+                    u, k, limiter = self.slots[idx]
+                    if limiter.try_acquire():
+                        self._idx = (idx + 1) % n
+                        return u, k
+                # All credentials are rate-limited — wait for the soonest one
+                waits = [
+                    (limiter.time_until_available(), i)
+                    for i, (_, _, limiter) in enumerate(self.slots)
+                ]
+                sleep_for, best_idx = min(waits)
+                sleep_for = max(sleep_for + 0.05, 0.05)  # small buffer
+                label = f"credential {best_idx} ({self.slots[best_idx][0]})"
+
+            print(f"All {len(self.slots)} credential(s) rate-limited. "
+                  f"Waiting {sleep_for:.2f}s for {label}...")
+            time.sleep(sleep_for)
+
+    def mark_rate_limited(self, username, api_key, backoff_seconds=60):
+        """Force a credential into backoff after receiving a 429 response."""
+        for u, k, limiter in self.slots:
+            if u == username and k == api_key:
+                limiter.force_backoff(backoff_seconds)
+                break
+
+
+# Instantiate a global credential pool
+pool = CredentialPool(list(zip(_usernames, _api_keys)))
 
 
 def _get_request(url, params, retry_backoff=60):
@@ -232,17 +292,17 @@ def _get_request(url, params, retry_backoff=60):
     Returns:
         response.json() (dict): dictionary with the data from the API
     """
-    limiter.acquire()
+    username, api_key = pool.acquire()
 
     try:
-        response = r.get(url, params=params, auth=(USERNAME, API_KEY))
+        response = r.get(url, params=params, auth=(username, api_key))
         response.raise_for_status()  # Check for any request errors
     except r.exceptions.RequestException as e:
         print("Error occurred during the request:", str(e))
         if response.status_code == 429:
-            print(f"Received 429 Too Many Requests. Backing off and retrying in {retry_backoff} seconds.")
-            time.sleep(retry_backoff)
-            return _get_request(url, params, retry_backoff=retry_backoff*2)  # Retry the request after sleeping
+            print(f"Received 429 for {username}. Marking rate-limited, retrying in {retry_backoff}s.")
+            pool.mark_rate_limited(username, api_key, backoff_seconds=retry_backoff)
+            return _get_request(url, params, retry_backoff=retry_backoff*2)
         else:
             raise  # For other types of exceptions, re-raise the error
     return response.json()
