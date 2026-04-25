@@ -5,3 +5,16 @@
 .venv
 .vscode
 data/processed
+
+# Large binary / generated outputs
+*.pt
+*.tar
+*.tar.gz
+output/**/*.json
+output/notebook_exports/
+
+# Shell scripts (cluster job scripts)
+*.sh
+
+# Raw experiment data (contains Prolific IDs — GDPR)
+data/experiment_data_with_stimuli_for_R.csv
