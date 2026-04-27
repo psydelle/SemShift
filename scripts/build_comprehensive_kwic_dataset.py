@@ -13,6 +13,9 @@ import click
 from tqdm import tqdm
 from pathlib import Path
 from nltk.corpus import wordnet as wn
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
 from utils import get_vn_kwics, get_vn_wordsketch, get_concreteness_rating, get_len_synset, load_snd_data
 
 # Load environment variables

@@ -41,6 +41,8 @@ import warnings
 import torch
 import numpy as np
 import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 
 ROOT      = Path(__file__).parent
@@ -90,6 +92,60 @@ def pair_mean_emb(rec, key):
         )
     return emb.mean(dim=0)  # collapse 100 KWICs → one mean vector, shape (384,)
 
+def apd(emb: torch.Tensor) -> float:
+    """Mean pairwise cosine distance across n context embeddings (n, d).
+    APD = 0 means all contexts are identical; higher = more variable meaning."""
+    normed = emb / emb.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    sim = normed @ normed.T                          # (n, n)
+    dist = 1 - sim
+    n = emb.shape[0]
+    mask = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+    return dist[mask].mean().item()
+
+
+def samd(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Symmetric Average Minimum Distance between two sets of usage embeddings.
+    Greedily matches each embedding in A to its nearest in B (one-to-one),
+    sampling min(|A|, |B|) from each set first.
+    
+    Arguments:
+    - a, b: tensors of shape (n_a, d) and (n_b, d) representing n_a and n_b usage embeddings for the same verb in two conditions
+      
+      """
+    n = min(len(a), len(b))
+    a = a[:n]
+    b = b[:n]
+    a_n = a / a.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    b_n = b / b.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    D = (1 - a_n @ b_n.T).numpy()          # (n, n) pairwise cosine distances
+    total, used_rows, used_cols = 0.0, set(), set()
+    flat = D.flatten().argsort()
+    for idx in flat:
+        i, j = divmod(int(idx), n)
+        if i in used_rows or j in used_cols:
+            continue
+        total += D[i, j] # a_i and b_j are each other's closest match among the remaining embeddings
+        used_rows.add(i)
+        used_cols.add(j)
+        if len(used_rows) == n:
+            break
+    return total / n
+
+
+def best_k(emb: torch.Tensor, k_range=range(2, 6)) -> int:
+    """K-means over context embeddings; pick k by silhouette score."""
+    X = emb.numpy()
+    best, best_score = 2, -1.0
+    for k in k_range:
+        if k >= len(X):
+            break
+        labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
+        score = silhouette_score(X, labels)
+        if score > best_score:
+            best_score, best = score, k
+    return best
+
+
 def cos_sim(a, b):
     """
     Cosine similarity between two 1-D embedding vectors.
@@ -138,10 +194,12 @@ print(f"\n[1/2] Loading {VERBS_PT.name} "
 verbs_pt = torch.load(VERBS_PT, map_location='cpu', weights_only=False)
 print(f"      {len(verbs_pt):,} pairs loaded")
 
-verb_pool   = {}  # verb  -> [mean_emb_in_context_1, mean_emb_in_context_2, ...]
-noun_pool_v = {}  # noun  -> [mean_emb per seed-verb context] (fallback X[noun] if not in nouns.pt)
-y_verb      = {}  # "verb noun" -> mean verb embedding for that stimuli pair
-y_noun      = {}  # "verb noun" -> mean noun embedding for that stimuli pair
+verb_pool     = {}  # verb  -> [mean_emb_in_context_1, mean_emb_in_context_2, ...]
+noun_pool_v   = {}  # noun  -> [mean_emb per seed-verb context] (fallback X[noun] if not in nouns.pt)
+y_verb        = {}  # "verb noun" -> mean verb embedding for that stimuli pair
+y_noun        = {}  # "verb noun" -> mean noun embedding for that stimuli pair
+y_verb_raw    = {}  # "verb noun" -> (n_kwics, 384) raw verb embeddings for stimuli pairs
+y_noun_raw    = {}  # "verb noun" -> (n_kwics, 384) raw noun embeddings for stimuli pairs
 
 for pair_key, pair_record in verbs_pt.items(): 
     # pair key: "verb noun"
@@ -167,6 +225,8 @@ for pair_key, pair_record in verbs_pt.items():
     if pair_key in stimuli_pairs:
         y_verb[pair_key] = v_mean
         y_noun[pair_key] = n_mean
+        y_verb_raw[pair_key] = pair_record['verb_embeddings'].cpu()
+        y_noun_raw[pair_key] = pair_record['noun_embeddings'].cpu()
 
 del verbs_pt  # free ~2.6 GB before loading next file
 
@@ -267,6 +327,27 @@ if len(x_noun) == 0:
 # Lower = more shift from prototype = more context-dependent / idiomatic behaviour.
 # ---------------------------------------------------------------------------
 
+# Build per-verb SAMD: one collocational and one productive pairing per verb.
+# y_verb_raw keyed by "verb noun"; stimuli has condition per row.
+pair_condition = dict(zip(
+    stimuli['verb'].str.lower() + ' ' + stimuli['noun'].str.lower(),
+    stimuli['Condition'].str.lower()
+))
+
+verb_samd = {}
+verbs_seen = set(stimuli['verb'].str.lower())
+for v in verbs_seen:
+    colloc_key = next((k for k, c in pair_condition.items()
+                       if k.startswith(v + ' ') and c == 'collocation'
+                       and k in y_verb_raw), None)
+    prod_key   = next((k for k, c in pair_condition.items()
+                       if k.startswith(v + ' ') and c == 'productive'
+                       and k in y_verb_raw), None)
+    if colloc_key and prod_key:
+        verb_samd[v] = samd(y_verb_raw[colloc_key], y_verb_raw[prod_key])
+
+print(f"SAMD computed for {len(verb_samd)} verbs with both conditions")
+
 print("\nComputing Deltas...", flush=True)
 
 rows    = []
@@ -289,20 +370,29 @@ for _, row in stimuli.iterrows():
     if pair_key in y_verb and v in x_verb:
         r['verb_delta_cos']  = cos_sim(x_verb[v], y_verb[pair_key])
         r['verb_pool_size']  = verb_pool_n.get(v)
+        r['verb_apd']        = apd(y_verb_raw[pair_key])
+        r['verb_n_clusters'] = best_k(y_verb_raw[pair_key])
+        r['verb_samd']       = verb_samd.get(v)   # same value for both pairings of this verb
     else:
         r['verb_delta_cos']  = None
         r['verb_pool_size']  = None
+        r['verb_apd']        = None
+        r['verb_n_clusters'] = None
+        r['verb_samd']       = None
         skipped.append(f"verb missing: {pair_key}")
 
     # Noun Delta: how far has the noun shifted from its prototype in this pairing?
     if pair_key in y_noun and n in x_noun:
         r['noun_delta_cos']  = cos_sim(x_noun[n], y_noun[pair_key])
         r['noun_pool_size']  = noun_pool_n.get(n)
-
+        r['noun_apd']        = apd(y_noun_raw[pair_key])
+        r['noun_n_clusters'] = best_k(y_noun_raw[pair_key])
     else:
         r['noun_delta_cos']  = None
         r['noun_pool_size']  = None
         r['noun_x_source']   = None
+        r['noun_apd']        = None
+        r['noun_n_clusters'] = None
         skipped.append(f"noun missing: {pair_key}")
 
     rows.append(r)

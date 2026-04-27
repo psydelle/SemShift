@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 from tqdm import tqdm
 import json
 import re
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
 from utils import get_vn_kwics
 
 # Load environment variables from .env

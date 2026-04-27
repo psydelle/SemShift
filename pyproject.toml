@@ -18,4 +18,5 @@ dependencies = [
     "spacy>=3.8.11",
     "tqdm>=4.67.3",
     "transformers<5",
+    "statsmodels>=0.14.2",
 ]
