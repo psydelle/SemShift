@@ -37,6 +37,7 @@ Writes:
 """
 
 from pathlib import Path
+import argparse
 import warnings
 import torch
 import numpy as np
@@ -48,8 +49,16 @@ from sklearn.metrics import silhouette_score
 ROOT      = Path(__file__).parent
 VERBS_PT  = ROOT / 'output' / 'output_verbs' / 'verbs.pt'
 NOUNS_PT  = ROOT / 'output' / 'output_nouns' / 'nouns.pt'
-STIMULI   = ROOT / 'data' / 'iRT_AJT.csv'
-OUT       = ROOT / 'output' / 'verb_noun_deltas.csv'
+
+parser = argparse.ArgumentParser(description="Compute LSCD delta metrics for a stimuli CSV.")
+parser.add_argument('--stimuli', default=str(ROOT / 'data' / 'iRT_AJT.csv'),
+                    help='Path to stimuli CSV (must have verb, noun, Condition, Item columns)')
+parser.add_argument('--output',  default=str(ROOT / 'output' / 'verb_noun_deltas.csv'),
+                    help='Path to write output CSV')
+args = parser.parse_args()
+
+STIMULI = Path(args.stimuli)
+OUT     = Path(args.output)
 
 
 for path, name in [(VERBS_PT, 'verbs.pt'), (NOUNS_PT, 'nouns.pt'), (STIMULI, 'iRT_AJT.csv')]:
@@ -236,10 +245,10 @@ x_verb      = {v: torch.stack(embs).mean(0) for v, embs in verb_pool.items()
                if v in stimuli_verbs}
 verb_pool_n = {v: len(embs) for v, embs in verb_pool.items()}  # pool size for diagnostics
 
-# # Build X[noun] fallback: noun prototype from verb-queried contexts only.
-# # Used only if the noun is not a seed word in nouns.pt (so pool will be smaller).
-# x_noun_fallback = {n: torch.stack(embs).mean(0) for n, embs in noun_pool_v.items()
-#                    if n in stimuli_nouns}
+# Build X[noun] fallback: noun prototype from verb-queried contexts only.
+# Used only if the noun is not a seed word in nouns.pt (so pool will be smaller).
+x_noun_fallback = {n: torch.stack(embs).mean(0) for n, embs in noun_pool_v.items()
+                   if n in stimuli_nouns}
 
 del verb_pool, noun_pool_v
 
@@ -299,13 +308,13 @@ del noun_pool
 
 print(f"      X[noun] ready for {len(x_noun)} stimuli nouns (from nouns file)")
 
-# # For any stimuli noun not present as a seed word in nouns.pt, fall back to the
-# # noun prototype built from verb-queried contexts in PASS 1.
-# # Pool size is flagged as -1 so downstream analysis can identify these items.
-# for n in stimuli_nouns:
-#     if n not in x_noun and n in x_noun_fallback:
-#         x_noun[n] = x_noun_fallback[n]
-#         noun_pool_n[n] = -1  # flag: prototype came from verbs.pt, not nouns.pt
+# For any stimuli noun not present as a seed word in nouns.pt, fall back to the
+# noun prototype built from verb-queried contexts in PASS 1.
+# Pool size is flagged as -1 so downstream analysis can identify these items.
+for n in stimuli_nouns:
+    if n not in x_noun and n in x_noun_fallback:
+        x_noun[n] = x_noun_fallback[n]
+        noun_pool_n[n] = -1  # flag: prototype came from verbs.pt, not nouns.pt
 
 if len(x_noun) == 0:
     raise RuntimeError(
@@ -385,6 +394,7 @@ for _, row in stimuli.iterrows():
     if pair_key in y_noun and n in x_noun:
         r['noun_delta_cos']  = cos_sim(x_noun[n], y_noun[pair_key])
         r['noun_pool_size']  = noun_pool_n.get(n)
+        r['noun_x_source']   = 'verbs_pt_fallback' if noun_pool_n.get(n) == -1 else 'nouns_pt'
         r['noun_apd']        = apd(y_noun_raw[pair_key])
         r['noun_n_clusters'] = best_k(y_noun_raw[pair_key])
     else:

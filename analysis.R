@@ -164,4 +164,106 @@ m_noun50 <- lmer(log_RT ~ noun_delta_z * Condition + (1 | participant_id),
                  data = t50, REML = FALSE)
 print(summary(m_noun50))
 
+# ---------------------------------------------------------------------------
+# RQ1c — Three-condition comparison: Productive vs Collocation vs Idiom
+# ---------------------------------------------------------------------------
+
+cat("\n\n====== RQ1c: Three-condition comparison (Productive / Collocation / Idiom) ======\n")
+
+idiom_deltas <- read_csv("output/verb_noun_deltas_idioms.csv", show_col_types = FALSE)
+cat("Idiom items:", nrow(idiom_deltas), "\n")
+
+# Paired t-test within idiom condition
+cat("\n--- Idiom: paired t-test (verb vs noun delta cosine) ---\n")
+idiom_c <- idiom_deltas %>% drop_na(verb_delta_cos, noun_delta_cos)
+t_idiom  <- t.test(idiom_c$verb_delta_cos, idiom_c$noun_delta_cos, paired = TRUE)
+print(t_idiom)
+d_idiom <- cohens_d(idiom_c$verb_delta_cos - idiom_c$noun_delta_cos)
+cat("Cohen's d:", round(d_idiom$Cohens_d, 3), "\n")
+
+# Mean delta by condition across all three
+cat("\n--- Mean delta cosine by condition ---\n")
+all3 <- bind_rows(
+  item        %>% select(item, condition, verb_delta_cos, noun_delta_cos, iRT_AJT),
+  idiom_deltas %>% select(item, condition, verb_delta_cos, noun_delta_cos, iRT_AJT)
+)
+all3 %>%
+  group_by(condition) %>%
+  summarise(n = n(),
+            verb_mean = mean(verb_delta_cos, na.rm = TRUE),
+            noun_mean = mean(noun_delta_cos, na.rm = TRUE),
+            diff      = verb_mean - noun_mean,
+            .groups = "drop") %>%
+  print()
+
+# OLS: word_type * condition across all three conditions
+cat("\n--- M_3cond: delta_cos ~ word_type * condition (all three conditions) ---\n")
+long3 <- bind_rows(
+  all3 %>% select(item, condition, verb_delta_cos) %>%
+    rename(delta_cos = verb_delta_cos) %>% mutate(word_type = "verb"),
+  all3 %>% select(item, condition, noun_delta_cos) %>%
+    rename(delta_cos = noun_delta_cos) %>% mutate(word_type = "noun")
+) %>% drop_na(delta_cos) %>%
+  mutate(
+    word_type = relevel(factor(word_type), ref = "noun"),
+    condition = relevel(factor(condition), ref = "Productive")
+  )
+
+m_3cond <- lm(delta_cos ~ word_type * condition, data = long3)
+print(summary(m_3cond))
+
+# RQ2 for idioms: does delta predict RT?
+cat("\n--- Idiom RQ2: does delta predict iRT? ---\n")
+for (f in c("iRT_AJT ~ verb_delta_cos", "iRT_AJT ~ noun_delta_cos")) {
+  fit <- lm(as.formula(f), data = idiom_c)
+  cat(sprintf("\n%s:  R2=%.4f  adj-R2=%.4f\n", f,
+              summary(fit)$r.squared, summary(fit)$adj.r.squared))
+  print(coef(summary(fit)))
+}
+
+# ---------------------------------------------------------------------------
+# RQ1d — APD and clustering: can embeddings distinguish idiom from productive?
+#
+# If the model captures idiomaticity, idiom KWICs should be more variable
+# (some sentences literal, some idiomatic) → higher APD, more clusters.
+# If APD(idiom) ≈ APD(productive), the metric is likely blind to idiomaticity.
+# ---------------------------------------------------------------------------
+
+cat("\n\n====== RQ1d: APD and clustering — idiom vs productive vs collocation ======\n")
+
+apd_data <- bind_rows(
+  deltas       %>% select(condition, verb_apd, noun_apd, verb_n_clusters, noun_n_clusters),
+  idiom_deltas %>% select(condition, verb_apd, noun_apd, verb_n_clusters, noun_n_clusters)
+) %>% mutate(condition = factor(condition, levels = c("Productive", "Idiom", "Collocation")))
+
+cat("\n--- Mean APD and cluster count by condition ---\n")
+apd_data %>%
+  group_by(condition) %>%
+  summarise(
+    n              = n(),
+    verb_apd       = mean(verb_apd,        na.rm = TRUE),
+    noun_apd       = mean(noun_apd,        na.rm = TRUE),
+    verb_clusters  = mean(verb_n_clusters, na.rm = TRUE),
+    noun_clusters  = mean(noun_n_clusters, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% print()
+
+cat("\n--- t-tests: Idiom vs Productive ---\n")
+for (col in c("verb_apd", "noun_apd", "verb_n_clusters", "noun_n_clusters")) {
+  idiom_vals <- apd_data %>% filter(condition == "Idiom")    %>% pull(!!col) %>% na.omit()
+  prod_vals  <- apd_data %>% filter(condition == "Productive") %>% pull(!!col) %>% na.omit()
+  tt <- t.test(idiom_vals, prod_vals)
+  cat(sprintf("  %-20s  idiom=%.3f  prod=%.3f  t=%.3f  p=%.4f\n",
+              col, mean(idiom_vals), mean(prod_vals), tt$statistic, tt$p.value))
+}
+
+cat("\n--- t-tests: Idiom vs Collocation ---\n")
+for (col in c("verb_apd", "noun_apd", "verb_n_clusters", "noun_n_clusters")) {
+  idiom_vals  <- apd_data %>% filter(condition == "Idiom")       %>% pull(!!col) %>% na.omit()
+  colloc_vals <- apd_data %>% filter(condition == "Collocation") %>% pull(!!col) %>% na.omit()
+  tt <- t.test(idiom_vals, colloc_vals)
+  cat(sprintf("  %-20s  idiom=%.3f  colloc=%.3f  t=%.3f  p=%.4f\n",
+              col, mean(idiom_vals), mean(colloc_vals), tt$statistic, tt$p.value))
+}
+
 cat("\nDone.\n")
